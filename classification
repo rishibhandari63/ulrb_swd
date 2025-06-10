@@ -1,0 +1,137 @@
+# Load required packages
+library(ulrb)
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1. Extract and prepare data from phyloseq object
+# Get OTU table (samples in rows, ASVs in columns)
+otu_df <- as.data.frame(otu_table(d16S))
+
+# Get taxonomy table (ASVs in rows)
+tax_df <- as.data.frame(tax_table(d16S))
+
+# Verify orientation
+if(taxa_are_rows(d16S)) {
+  # If taxa are rows in phyloseq but columns in OTU table, we need to transpose tax_df
+  tax_df <- t(tax_df)
+}
+
+# 2. Align the data
+# Check if ASV names match between OTU and taxonomy tables
+asv_names_otu <- colnames(otu_df)
+asv_names_tax <- rownames(tax_df)
+
+if(!all(asv_names_otu %in% asv_names_tax)) {
+  warning("Some ASVs in OTU table not found in taxonomy table - these will be removed")
+  common_asvs <- intersect(asv_names_otu, asv_names_tax)
+  otu_df <- otu_df[, common_asvs, drop = FALSE]
+  tax_df <- tax_df[common_asvs, , drop = FALSE]
+}
+
+# 3. Combine data
+# First transpose OTU table to get ASVs as rows
+otu_t <- t(otu_df) %>% 
+  as.data.frame() %>%
+  mutate(ASV = rownames(.))
+
+# Combine with taxonomy
+nice_clean <- left_join(otu_t, 
+                       tax_df %>% 
+                         mutate(ASV = rownames(.)), 
+                       by = "ASV")
+
+# 4. Clean the data
+nice_clean <- nice_clean %>%
+  # Remove eukaryotes if present
+  filter(if("Kingdom" %in% colnames(.)) Kingdom != "Eukaryota" | is.na(Kingdom) else TRUE) %>%
+  # Remove unclassified ASVs at phylum level
+  filter(!is.na(phylum))
+
+# 5. Prepare tidy data format
+sample_names <- rownames(otu_df)  # Original sample names from OTU table
+nice_tidy <- prepare_tidy_data(nice_clean, 
+                             sample_names = sample_names, 
+                             samples_in = "cols")
+
+# 6. Define rare biosphere
+# Automated version that selects optimal number of clusters
+classified_table <- define_rb(nice_tidy)
+
+colnames(classified_table)
+
+# 7. Analyze results
+# Classification summary
+classification_summary <- classified_table %>%
+  group_by(Sample, Classification) %>%
+  summarize(
+    ASV_count = n(),
+    Total_abundance = sum(Abundance),
+    .groups = "drop"
+  )
+
+# View summary
+print(classification_summary)
+
+classified_table %>% 
+  select(ASV, Sample, Abundance, 
+         Classification, Silhouette_scores, Cluster_median_abundance, 
+         pam_object) %>% 
+  head()
+
+# Visualization
+ggplot(classification_summary, aes(x = Sample, y = ASV_count, fill = Classification)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(y = "Proportion of ASVs", title = "Rare biosphere classification") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 8. Optional: Add classification to phyloseq object
+# Create classification matrix (samples x ASVs)
+classification_wide <- classified_table %>%
+  select(ASV, Sample, Classification) %>%
+  pivot_wider(names_from = Sample, values_from = Classification)
+
+# Merge with original data
+merged_tax <- tax_table(d16S) %>%
+  as.data.frame() %>%
+  mutate(ASV = rownames(.)) %>%
+  left_join(classification_wide, by = "ASV") %>%
+  as.matrix()
+
+# Update phyloseq object
+tax_table(d16S) <- tax_table(merged_tax)
+
+
+# One sample as example
+plot_ulrb_clustering(classified_table, 
+                       sample_id = selected_samples[1],
+                       taxa_col = "ASV") +
+  labs(title = paste("Clustering for sample", selected_samples[1]))
+
+# All samples, with centrality metric
+plot_ulrb_clustering(classified_table,
+                     taxa_col = "ASV", 
+                     plot_all = TRUE, 
+                     log_scaled = TRUE) +
+  labs(title = "Clustering for all samples")
+
+
+
+library(dplyr)
+
+# Assuming 'classified_table' is your ulrb output (from define_rb())
+# It should have columns: ASV, Sample, Classification
+
+# 1. Count how many times each ASV is rare/abundant across samples
+rarity_summary <- classified_table %>%
+  group_by(ASV) %>%
+  summarize(
+    total_samples = n(),
+    n_abundant = sum(Classification == "Abundant"),
+    n_rare = sum(Classification == "Rare"),
+    occurrence = sum(Abundance > 0)) # Optional: counts presence (non-zero abundance)
+
+
+write.csv(rarity_summary, "rarity_summary.csv", row.names = FALSE)
