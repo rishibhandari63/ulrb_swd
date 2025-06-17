@@ -1,137 +1,238 @@
+```{r}
 # Load required packages
 library(ulrb)
 library(phyloseq)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
+library(microbiome)
+library(metagenomeSeq)
+library(tibble)  # for rownames_to_column()
 
-# 1. Extract and prepare data from phyloseq object
-# Get OTU table (samples in rows, ASVs in columns)
-otu_df <- as.data.frame(otu_table(d16S))
+# Load phyloseq object
+d16S <- readRDS("./16S.Gallow_PS-2.rds")
 
-# Get taxonomy table (ASVs in rows)
-tax_df <- as.data.frame(tax_table(d16S))
+# CSS normalization using metagenomeSeq
+MGS <- phyloseq_to_metagenomeSeq(d16S)
+p <- cumNormStatFast(MGS)
+MGS <- cumNorm(MGS, p = p)
+norm.bacteria <- MRcounts(MGS, norm = TRUE)
+norm.bacteria.OTU <- otu_table(norm.bacteria, taxa_are_rows = TRUE)
 
-# Verify orientation
-if(taxa_are_rows(d16S)) {
-  # If taxa are rows in phyloseq but columns in OTU table, we need to transpose tax_df
-  tax_df <- t(tax_df)
-}
+# Create normalized phyloseq object
+bacteria.css.norm <- phyloseq(
+  norm.bacteria.OTU,
+  tax_table(d16S),
+  refseq(d16S),
+  phy_tree(d16S),
+  sample_data(d16S)
+)
 
-# 2. Align the data
-# Check if ASV names match between OTU and taxonomy tables
-asv_names_otu <- colnames(otu_df)
-asv_names_tax <- rownames(tax_df)
+# Subset for "Fly" host
+d16S_fly <- subset_samples(bacteria.css.norm, Host == "Fly")
 
-if(!all(asv_names_otu %in% asv_names_tax)) {
-  warning("Some ASVs in OTU table not found in taxonomy table - these will be removed")
-  common_asvs <- intersect(asv_names_otu, asv_names_tax)
-  otu_df <- otu_df[, common_asvs, drop = FALSE]
-  tax_df <- tax_df[common_asvs, , drop = FALSE]
-}
+# Core filtering
+d16S_fly <- core(
+  d16S_fly,
+  detection = 10,
+  prevalence = 0.10
+)
 
-# 3. Combine data
-# First transpose OTU table to get ASVs as rows
-otu_t <- t(otu_df) %>% 
-  as.data.frame() %>%
-  mutate(ASV = rownames(.))
+# Verify data exists after filtering
+if (ntaxa(d16S_fly) == 0) stop("No ASVs passed core filtering!")
 
-# Combine with taxonomy
-nice_clean <- left_join(otu_t, 
-                       tax_df %>% 
-                         mutate(ASV = rownames(.)), 
-                       by = "ASV")
+# 2. Prepare Data for Classification --------------------------------------
+# Extract and align data
+otu_df <- as.data.frame(otu_table(d16S_fly))
+if (!taxa_are_rows(d16S_fly)) otu_df <- t(otu_df) %>% as.data.frame()
 
-# 4. Clean the data
-nice_clean <- nice_clean %>%
-  # Remove eukaryotes if present
-  filter(if("Kingdom" %in% colnames(.)) Kingdom != "Eukaryota" | is.na(Kingdom) else TRUE) %>%
-  # Remove unclassified ASVs at phylum level
-  filter(!is.na(phylum))
+# Safest method - rounds while preserving zeros
+otu_df<- otu_df %>% 
+  mutate(across(where(is.numeric), ~ ifelse(. == 0, 0, round(.))))
 
-# 5. Prepare tidy data format
-sample_names <- rownames(otu_df)  # Original sample names from OTU table
-nice_tidy <- prepare_tidy_data(nice_clean, 
-                             sample_names = sample_names, 
-                             samples_in = "cols")
+tax_df <- as.data.frame(tax_table(d16S_fly))
 
-# 6. Define rare biosphere
-# Automated version that selects optimal number of clusters
-classified_table <- define_rb(nice_tidy)
+# Safety checks
+common_asvs <- intersect(rownames(otu_df), rownames(tax_df))
+if (length(common_asvs) == 0) stop("No matching ASVs between OTU and taxonomy tables!")
 
-colnames(classified_table)
+# Merge and clean
+nice_clean <- otu_df[common_asvs, ] %>%
+  rownames_to_column("ASV") %>%
+  left_join(
+    tax_df[common_asvs, ] %>% rownames_to_column("ASV"),
+    by = "ASV"
+  ) %>%
+  filter(Kingdom != "Eukaryota" | is.na(Kingdom)) %>%
+  filter(!is.na(Phylum))
 
-# 7. Analyze results
-# Classification summary
+# 3. Rare Biosphere Classification ---------------------------------------
+nice_tidy <- prepare_tidy_data(
+  nice_clean,
+  sample_names = colnames(otu_df),
+  samples_in = "cols"
+)
+
+classified_table <- define_rb(nice_tidy)  # Silhouette warnings are normal
+
+# 4. Create Wide Format Classification Matrix ----------------------------
+classification_wide <- classified_table %>%
+  dplyr::select(ASV, Sample, Classification) %>%
+  mutate(Classification = as.character(Classification)) %>% # Convert factor
+  tidyr::pivot_wider(
+    names_from = Sample,
+    values_from = Classification,
+    values_fill = "NotPresent"
+  )
+
+# Save results
+write.csv(classification_wide, "fly_classification_wide.csv", row.names = FALSE)
+
+# 5. Generate ASV Summary Counts -----------------------------------------
+asv_summary <- classified_table %>%
+  group_by(ASV, Classification) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from = Classification,
+    values_from = Count,
+    values_fill = list(Count = 0)
+  )
+
+write.csv(asv_summary, "fly_asv_summary.csv", row.names = FALSE)
+
+# 6. Visualization ------------------------------------------------------
+# Classification proportions
 classification_summary <- classified_table %>%
   group_by(Sample, Classification) %>%
-  summarize(
+  summarise(
     ASV_count = n(),
     Total_abundance = sum(Abundance),
     .groups = "drop"
   )
 
-# View summary
-print(classification_summary)
-
-classified_table %>% 
-  select(ASV, Sample, Abundance, 
-         Classification, Silhouette_scores, Cluster_median_abundance, 
-         pam_object) %>% 
-  head()
-
-# Visualization
 ggplot(classification_summary, aes(x = Sample, y = ASV_count, fill = Classification)) +
   geom_bar(stat = "identity", position = "fill") +
-  labs(y = "Proportion of ASVs", title = "Rare biosphere classification") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  labs(title = "fly microbiome Classification") +
+  theme_minimal()
 
-# 8. Optional: Add classification to phyloseq object
-# Create classification matrix (samples x ASVs)
-classification_wide <- classified_table %>%
-  select(ASV, Sample, Classification) %>%
-  pivot_wider(names_from = Sample, values_from = Classification)
+# ULRB plot
+pdf("fly_ulrb_plot.pdf", width = 8, height = 5)
+plot_ulrb(
+  classified_table,
+  taxa_col = "ASV",
+  plot_all = TRUE,
+  log_scaled = TRUE,
+  colors = c("Abundant" = "#E69F00", "Rare" = "#FC4E07", "Undetermined" = "#56B4E9")
+)
+dev.off()
 
-# Merge with original data
-merged_tax <- tax_table(d16S) %>%
-  as.data.frame() %>%
-  mutate(ASV = rownames(.)) %>%
-  left_join(classification_wide, by = "ASV") %>%
-  as.matrix()
-
-# Update phyloseq object
-tax_table(d16S) <- tax_table(merged_tax)
+```
 
 
-# One sample as example
-plot_ulrb_clustering(classified_table, 
-                       sample_id = selected_samples[1],
-                       taxa_col = "ASV") +
-  labs(title = paste("Clustering for sample", selected_samples[1]))
-
-# All samples, with centrality metric
-plot_ulrb_clustering(classified_table,
-                     taxa_col = "ASV", 
-                     plot_all = TRUE, 
-                     log_scaled = TRUE) +
-  labs(title = "Clustering for all samples")
-
-
-
+```{r}
+# Load required packages with explicit imports
 library(dplyr)
+library(tidyr)
+library(phyloseq)
+library(ulrb)
+library(ggplot2)
 
-# Assuming 'classified_table' is your ulrb output (from define_rb())
-# It should have columns: ASV, Sample, Classification
+# 1. Data Preparation -----------------------------------------------------
+# Subset for Grapes host
+d16S_grapes <- subset_samples(bacteria.css.norm, Host == "Grapes")
 
-# 1. Count how many times each ASV is rare/abundant across samples
-rarity_summary <- classified_table %>%
-  group_by(ASV) %>%
-  summarize(
-    total_samples = n(),
-    n_abundant = sum(Classification == "Abundant"),
-    n_rare = sum(Classification == "Rare"),
-    occurrence = sum(Abundance > 0)) # Optional: counts presence (non-zero abundance)
+# Core filtering
+d16S_grapes <- core(
+  d16S_grapes,
+  detection = 10,
+  prevalence = 0.10
+)
 
+# Verify data exists after filtering
+if (ntaxa(d16S_grapes) == 0) stop("No ASVs passed core filtering!")
 
-write.csv(rarity_summary, "rarity_summary.csv", row.names = FALSE)
+# 2. Prepare Data for Classification --------------------------------------
+# Extract and align data
+otu_df <- as.data.frame(otu_table(d16S_grapes))
+if (!taxa_are_rows(d16S_grapes)) otu_df <- t(otu_df) %>% as.data.frame()
+
+# Safest method - rounds while preserving zeros
+otu_df<- otu_df %>% 
+  mutate(across(where(is.numeric), ~ ifelse(. == 0, 0, round(.))))
+
+tax_df <- as.data.frame(tax_table(d16S_grapes))
+
+# Safety checks
+common_asvs <- intersect(rownames(otu_df), rownames(tax_df))
+if (length(common_asvs) == 0) stop("No matching ASVs between OTU and taxonomy tables!")
+
+# Merge and clean
+nice_clean <- otu_df[common_asvs, ] %>%
+  rownames_to_column("ASV") %>%
+  left_join(
+    tax_df[common_asvs, ] %>% rownames_to_column("ASV"),
+    by = "ASV"
+  ) %>%
+  filter(Kingdom != "Eukaryota" | is.na(Kingdom)) %>%
+  filter(!is.na(Phylum))
+
+# 3. Rare Biosphere Classification ---------------------------------------
+nice_tidy <- prepare_tidy_data(
+  nice_clean,
+  sample_names = colnames(otu_df),
+  samples_in = "cols"
+)
+
+classified_table <- define_rb(nice_tidy)  # Silhouette warnings are normal
+
+# 4. Create Wide Format Classification Matrix ----------------------------
+classification_wide <- classified_table %>%
+  dplyr::select(ASV, Sample, Classification) %>%
+  mutate(Classification = as.character(Classification)) %>% # Convert factor
+  tidyr::pivot_wider(
+    names_from = Sample,
+    values_from = Classification,
+    values_fill = "NotPresent"
+  )
+
+# Save results
+write.csv(classification_wide, "grapes_classification_wide.csv", row.names = FALSE)
+
+# 5. Generate ASV Summary Counts -----------------------------------------
+asv_summary <- classified_table %>%
+  group_by(ASV, Classification) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from = Classification,
+    values_from = Count,
+    values_fill = list(Count = 0)
+  )
+
+write.csv(asv_summary, "grapes_asv_summary.csv", row.names = FALSE)
+
+# 6. Visualization ------------------------------------------------------
+# Classification proportions
+classification_summary <- classified_table %>%
+  group_by(Sample, Classification) %>%
+  summarise(
+    ASV_count = n(),
+    Total_abundance = sum(Abundance),
+    .groups = "drop"
+  )
+
+ggplot(classification_summary, aes(x = Sample, y = ASV_count, fill = Classification)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Grapes Rare Biosphere Classification") +
+  theme_minimal()
+
+# ULRB plot
+pdf("grapes_ulrb_plot.pdf", width = 8, height = 5)
+plot_ulrb(
+  classified_table,
+  taxa_col = "ASV",
+  plot_all = TRUE,
+  log_scaled = TRUE,
+  colors = c("Abundant" = "#E69F00", "Rare" = "#FC4E07", "Undetermined" = "#56B4E9")
+)
+dev.off()
+```
